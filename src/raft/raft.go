@@ -99,13 +99,7 @@ func (rf *Raft) LastLogIndexAndTerm() (int, int) {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	term = rf.currentTerm
-	isleader = rf.state == LEADER
-	return term, isleader
+	return rf.currentTerm, rf.state == LEADER
 }
 
 
@@ -203,8 +197,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				return
 			} else {
 				rf.mu.Lock()
-				log.Println("votedFor", rf.votedFor)
 				rf.votedFor = args.CandidateId
+				log.Println(rf.me, "votedFor", rf.votedFor)
 				rf.chanGrantVote <- true
 				rf.mu.Unlock()
 				reply.VoteGranted = true
@@ -214,41 +208,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) SendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-func (rf *Raft) BroadcastRequestVote() {
+func (rf *Raft) broadcastRequestVote() {
 	for i:=0; i<rf.n; i++ {
 		if i == rf.me {
 			continue
@@ -267,21 +232,16 @@ func (rf *Raft) BroadcastRequestVote() {
 			}
 			var reply RequestVoteReply
 
-			ok := rf.SendRequestVote(i, &args, &reply)
+			ok := rf.sendRequestVote(i, &args, &reply)
 			if ok {
-				if rf.currentTerm != reply.Term {
-					return
-				}
 				if reply.VoteGranted {
 					rf.mu.Lock()
 					rf.votedMe++
-					log.Println(rf.me, rf.votedMe, rf.n)
-					if rf.state == CANDIDATE && rf.votedMe > rf.n / 2 {
-						log.Println(rf.me, "not voted yet")
-						rf.chanVote <- true
-						log.Println(rf.me, "voted")
-					}
+					//log.Println(rf.me, rf.votedMe, rf.n)
 					rf.mu.Unlock()
+					if rf.state == CANDIDATE && rf.votedMe * 2 > rf.n {
+						rf.chanVote <- true
+					}
 				} else {
 					if reply.Term > rf.currentTerm {
 						rf.mu.Lock()
@@ -312,7 +272,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	rf.chanHeartBeat <- true
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -337,21 +297,24 @@ func (rf *Raft) broadcastAppendEntries() {
 		if i == rf.me {
 			continue
 		}
-		go func() {
+		go func(i int) {
 			var args AppendEntriesArgs
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntries(i, &args, &reply)
 			if ok {
-				if rf.currentTerm < reply.Term {
-					rf.mu.Lock()
-					log.Println(rf.me, "become follower")
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.state = FOLLOWER
-					rf.mu.Unlock()
+				if reply.Success {
+
+				} else {
+					if rf.currentTerm < reply.Term {
+						rf.mu.Lock()
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.state = FOLLOWER
+						rf.mu.Unlock()
+					}
 				}
 			}
-		}()
+		}(i)
 	}
 }
 
@@ -391,40 +354,51 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) FollowerJob() {
+	//log.Println(rf.me, "follower job", rf.votedFor)
 	select {
-		case <- rf.chanHeartBeat:
-		case <- rf.chanGrantVote:
-		case <- time.After(time.Duration(400 + rand.Intn(500)) * time.Millisecond):
-			log.Println("term", rf.currentTerm, rf.me, "become candidate")
+		case <- time.After(time.Duration(400 + rand.Intn(300)) * time.Millisecond):
+			//log.Println("term", rf.currentTerm, rf.me, "become candidate")
 			rf.mu.Lock()
 			rf.state = CANDIDATE
 			rf.mu.Unlock()
+		case <- rf.chanHeartBeat:
+		case <- rf.chanGrantVote:
 	}
 }
 
 func (rf *Raft) CandidateJob() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.currentTerm ++
 	rf.votedFor = rf.me
 	rf.votedMe = 1
-	go rf.BroadcastRequestVote()
+	rf.mu.Unlock()
+	go rf.broadcastRequestVote()
 
 	select {
+		case <- time.After(time.Duration(400 + rand.Intn(300)) * time.Millisecond):
+		//	log.Println(rf.me, "timeout")
 		case <- rf.chanHeartBeat:
 			log.Println("term", rf.currentTerm, rf.me, "back to follower")
 			rf.state = FOLLOWER
 		case <- rf.chanVote:
+			rf.mu.Lock()
 			log.Println("term", rf.currentTerm, rf.me, "become leader")
 			rf.state = LEADER
-		case <- time.After(time.Duration(500 + rand.Intn(300)) * time.Millisecond):
+			rf.nextIndex = make([]int, rf.n)
+			rf.matchIndex = make([]int, rf.n)
+			lastIdx, _ := rf.LastLogIndexAndTerm()
+			for i:=0; i<rf.n; i++ {
+				rf.nextIndex[i] = lastIdx + 1
+				rf.matchIndex[i] = 0
+			}
+			rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) LeaderJob() {
 	go rf.broadcastAppendEntries()
-	time.Sleep(70 * time.Millisecond)
+	//log.Println(rf.me, "send hb")
+	time.Sleep(75 * time.Millisecond)
 }
 
 func (rf *Raft) RaftLoop() {
@@ -473,9 +447,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, 0)
 
 	rf.chanVote = make(chan bool)
-	rf.chanHeartBeat = make(chan bool)
+	rf.chanHeartBeat = make(chan bool, 100)
 	rf.chanGrantVote = make(chan bool)
-	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
