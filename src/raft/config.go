@@ -440,6 +440,7 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
+					log.Println("ok", index1)
 					index = index1
 					break
 				}
