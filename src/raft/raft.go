@@ -175,28 +175,25 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
 		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-		reply.Term = rf.currentTerm
 		rf.state = FOLLOWER
-		rf.votedFor = -1
+		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastIdx, lastTerm := rf.LastLogIndexAndTerm()
-		if args.LastLogIndex < lastIdx {
-			reply.VoteGranted = false
+		if args.LastLogTerm < lastTerm {
 			return
-		} else if args.LastLogIndex == lastIdx {
-			if args.LastLogTerm < lastTerm {
-				reply.VoteGranted = false
+		} else {
+			if args.LastLogTerm == lastTerm && args.LastLogIndex < lastIdx {
 				return
 			} else {
 				rf.mu.Lock()
@@ -240,8 +237,11 @@ func (rf *Raft) broadcastRequestVote() {
 				if reply.VoteGranted {
 					rf.mu.Lock()
 					rf.votedMe++
-					//log.Println(rf.me, rf.votedMe, rf.n)
 					if rf.state == CANDIDATE && rf.votedMe * 2 > rf.n {
+						/** if not reset the state, the broadcast may be called for more than one times, which easily
+							cause the deadlock.
+						 */
+						rf.becomeFollower()
 						rf.chanVote <- true
 					}
 					rf.mu.Unlock()
@@ -249,7 +249,7 @@ func (rf *Raft) broadcastRequestVote() {
 					if reply.Term > rf.currentTerm {
 						rf.mu.Lock()
 						rf.currentTerm = reply.Term
-						rf.state = FOLLOWER
+						rf.becomeFollower()
 						rf.mu.Unlock()
 						return
 					}
@@ -282,11 +282,9 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.Println("send ae to", rf.me, rf.state)
-	// log.Println(rf.me, "t1", args.Term, "t2", rf.currentTerm, "args", args, "log", rf.log)
+	//log.Println(rf.me, "from", args.LeaderId, "selfLog", rf.log, "args", args, "on term", rf.currentTerm)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Println(rf.me, "receive")
 	rf.chanHeartBeat <- true
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -307,7 +305,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			conflictTerm := rf.log[args.PrevLogIndex].Term
 			reply.ConflictTerm = conflictTerm
 			reply.NewNextIndex = 1
-			for i:= args.PrevLogIndex; i>0; i-- {
+			for i:= args.PrevLogIndex; i>=0; i-- {
 				if rf.log[i].Term != conflictTerm {
 					reply.NewNextIndex = i + 1
 				}
@@ -316,33 +314,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		newStartIdx := args.PrevLogIndex + 1
-		for i:= 0; i< lastIdx-newStartIdx; i++ {
-			if rf.log[newStartIdx + i].Term != args.Entries[i].Term {
-				rf.log = rf.log[:newStartIdx+i]
-				break
+		for i:= 0; i<= lastIdx-newStartIdx; i++ {
+			if args.Entries != nil {
+				if rf.log[args.PrevLogIndex + i].Term != args.Entries[i].Term {
+					rf.log = rf.log[:newStartIdx+i]
+					break
+				}
 			}
 		}
 
 		rf.log = append(rf.log, args.Entries...)
 
 		if args.LeaderCommit > rf.commitIndex {
-			log.Println(args.PrevLogIndex)
 			lastEntryIndex := len(args.Entries) + args.PrevLogIndex
 			if args.LeaderCommit < lastEntryIndex {
 				rf.commitIndex = args.LeaderCommit
 			} else {
 				rf.commitIndex = lastEntryIndex
 			}
+			//log.Println(rf.me, rf.commitIndex)
 			rf.chanCommit <- true
 		}
-		//log.Println(rf.me, "commitIdx", rf.commitIndex, "loglen", len(rf.log))
 		reply.Success = true
 	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	log.Println(server, ok)
 	return ok
 }
 
@@ -364,6 +362,8 @@ func (rf *Raft) broadcastAppendEntries() {
 				Entries:		entries,
 				LeaderCommit: 	rf.commitIndex,
 			}
+
+			//log.Println(rf.me, i, args, rf.log)
 
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntries(i, &args, &reply)
@@ -396,19 +396,19 @@ func (rf *Raft) broadcastAppendEntries() {
 
 func (rf *Raft) CommitLogs() {
 	newCommitIndex := rf.commitIndex
-	for i:= rf.commitIndex; i<len(rf.log); i++ {
+	for i:= rf.commitIndex + 1; i<len(rf.log); i++ {
 		matchCount := 1
 		for j := range rf.peers {
 			if j == rf.me {
 				continue
 			}
-			log.Println("matchIndex", rf.matchIndex[j], "i", i, "t1", rf.log[i].Term, "t2", rf.currentTerm)
+			//log.Println(j, rf.matchIndex[j], i, rf.log[i].Term, rf.currentTerm)
 			if rf.matchIndex[j] >= i && rf.log[i].Term == rf.currentTerm {
 				matchCount++
 			}
 		}
 
-		log.Println("count", matchCount, "total", rf.n)
+		//log.Println(rf.me, rf.log[i])
 		if matchCount* 2 > rf.n {
 			newCommitIndex = i
 		}
@@ -420,7 +420,7 @@ func (rf *Raft) CommitLogs() {
 		rf.chanCommit <- true
 		rf.mu.Unlock()
 	}
-	log.Println(rf.me, "commitIdx", rf.commitIndex)
+	//log.Println(rf.me, "commitIdx", rf.commitIndex)
 
 }
 
@@ -433,6 +433,7 @@ func (rf *Raft) ApplyCommitted() {
 				for i:= rf.lastApplied+1; i<=rf.commitIndex; i++ {
 					rf.mu.Lock()
 					applyMsg := ApplyMsg{CommandValid:true, Command:rf.log[i].Command, CommandIndex:i}
+					//log.Println(rf.me, applyMsg)
 					rf.chanApply <- applyMsg
 					rf.lastApplied = i
 					rf.mu.Unlock()
@@ -461,6 +462,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.state == LEADER
 	logEntry := LogEntry{Term:term, Command:command}
+	//log.Println(rf.me, "start", command, rf.state)
 	if isLeader {
 		index = len(rf.log)
 		rf.log = append(rf.log, logEntry)
@@ -502,7 +504,7 @@ func (rf *Raft) CandidateJob() {
 
 	select {
 		case <- time.After(time.Duration(400 + rand.Intn(300)) * time.Millisecond):
-		//	log.Println(rf.me, "timeout")
+			rf.becomeFollower()
 		case <- rf.chanHeartBeat:
 			rf.becomeFollower()
 		case <- rf.chanVote:

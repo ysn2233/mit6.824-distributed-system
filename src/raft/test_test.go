@@ -160,6 +160,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
+	log.Println("disconnected")
 
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
@@ -180,6 +181,8 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+
+	log.Println("connected")
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
@@ -310,6 +313,7 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	log.Println(leader1, "disconnected")
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
@@ -322,16 +326,20 @@ func TestRejoin2B(t *testing.T) {
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	log.Println(leader2, "disconnected")
 
 	// old leader connected again
 	cfg.connect(leader1)
+	log.Println(leader1, "connected")
 
 	cfg.one(104, 2, true)
+	log.Println("one104")
 
 	// all together now
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)
+	log.Println("one105")
 
 	cfg.end()
 }
