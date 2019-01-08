@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"labgob"
 	"labrpc"
 	"log"
 	"math/rand"
@@ -112,14 +114,13 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -130,19 +131,21 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&term) != nil ||
+	   d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		log.Println("error when decoding")
+		return
+	} else {
+	  rf.currentTerm = term
+	  rf.votedFor = votedFor
+	  rf.log = logs
+	}
 }
 
 
@@ -185,6 +188,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		rf.state = FOLLOWER
+		rf.persist()
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 	}
@@ -198,7 +202,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			} else {
 				rf.mu.Lock()
 				rf.votedFor = args.CandidateId
-				log.Println(rf.me, "votedFor", rf.votedFor)
+				rf.persist()
+				//log.Println(rf.me, "votedFor", rf.votedFor)
 				rf.chanGrantVote <- true
 				rf.mu.Unlock()
 				reply.VoteGranted = true
@@ -279,6 +284,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) becomeFollower() {
 	rf.state = FOLLOWER
 	rf.votedFor = -1
+	rf.persist()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -298,32 +304,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastIdx, _ := rf.LastLogIndexAndTerm()
 	if args.PrevLogIndex > lastIdx {
 		reply.NewNextIndex = lastIdx + 1
-		reply.Success = false
 		return
 	} else {
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			conflictTerm := rf.log[args.PrevLogIndex].Term
 			reply.ConflictTerm = conflictTerm
 			reply.NewNextIndex = 1
-			for i:= args.PrevLogIndex; i>=0; i-- {
+			for i:= args.PrevLogIndex - 1; i>=0; i-- {
 				if rf.log[i].Term != conflictTerm {
 					reply.NewNextIndex = i + 1
+					return
 				}
 			}
+		}
+
+		conflict := false
+		newStartIdx := args.PrevLogIndex + 1
+		for i:= 0; i<= lastIdx-args.PrevLogIndex; i++ {
+			if lastIdx < newStartIdx +i || (args.Entries != nil && rf.log[newStartIdx + i].Term != args.Entries[i].Term) {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			reply.Success = true
 			return
 		}
 
-		newStartIdx := args.PrevLogIndex + 1
-		for i:= 0; i<= lastIdx-newStartIdx; i++ {
-			if args.Entries != nil {
-				if rf.log[args.PrevLogIndex + i].Term != args.Entries[i].Term {
-					rf.log = rf.log[:newStartIdx+i]
-					break
-				}
-			}
-		}
-
+		rf.log = rf.log[:newStartIdx]
 		rf.log = append(rf.log, args.Entries...)
+		rf.persist()
 
 		if args.LeaderCommit > rf.commitIndex {
 			lastEntryIndex := len(args.Entries) + args.PrevLogIndex
@@ -332,7 +342,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				rf.commitIndex = lastEntryIndex
 			}
-			//log.Println(rf.me, rf.commitIndex)
+			//log.Println(rf.me, "commitindex", rf.commitIndex)
 			rf.chanCommit <- true
 		}
 		reply.Success = true
@@ -351,6 +361,12 @@ func (rf *Raft) broadcastAppendEntries() {
 		}
 		go func(i int) {
 
+			if rf.state != LEADER {
+				return
+			}
+			if rf.nextIndex[i] > len(rf.log) {
+				rf.nextIndex[i] = len(rf.log)
+			}
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
 			entries := rf.log[rf.nextIndex[i]: ]
@@ -367,9 +383,6 @@ func (rf *Raft) broadcastAppendEntries() {
 
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntries(i, &args, &reply)
-			if rf.state != LEADER {
-				return
-			}
 			if ok {
 				if reply.Success {
 					rf.mu.Lock()
@@ -433,7 +446,6 @@ func (rf *Raft) ApplyCommitted() {
 				for i:= rf.lastApplied+1; i<=rf.commitIndex; i++ {
 					rf.mu.Lock()
 					applyMsg := ApplyMsg{CommandValid:true, Command:rf.log[i].Command, CommandIndex:i}
-					//log.Println(rf.me, applyMsg)
 					rf.chanApply <- applyMsg
 					rf.lastApplied = i
 					rf.mu.Unlock()
@@ -466,6 +478,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		index = len(rf.log)
 		rf.log = append(rf.log, logEntry)
+		rf.persist()
 	}
 
 
@@ -499,6 +512,7 @@ func (rf *Raft) CandidateJob() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.votedMe = 1
+	rf.persist()
 	rf.mu.Unlock()
 	go rf.broadcastRequestVote()
 
@@ -509,7 +523,7 @@ func (rf *Raft) CandidateJob() {
 			rf.becomeFollower()
 		case <- rf.chanVote:
 			rf.mu.Lock()
-			log.Println("term", rf.currentTerm, rf.me, "become leader")
+			//log.Println("term", rf.currentTerm, rf.me, "become leader")
 			rf.state = LEADER
 			rf.nextIndex = make([]int, rf.n)
 			rf.matchIndex = make([]int, rf.n)
