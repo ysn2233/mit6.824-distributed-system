@@ -288,7 +288,7 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//log.Println(rf.me, "from", args.LeaderId, "selfLog", rf.log, "args", args, "on term", rf.currentTerm)
+	log.Println(rf.me, "from", args.LeaderId, "selfLog", rf.log, "args", args, "on term", rf.currentTerm)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.chanHeartBeat <- true
@@ -342,7 +342,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				rf.commitIndex = lastEntryIndex
 			}
-			//log.Println(rf.me, "commitindex", rf.commitIndex)
+			log.Println(rf.me, "commitindex", rf.commitIndex)
 			rf.chanCommit <- true
 		}
 		reply.Success = true
@@ -361,13 +361,11 @@ func (rf *Raft) broadcastAppendEntries() {
 		}
 		go func(i int) {
 
-			if rf.state != LEADER {
-				return
-			}
 			if rf.nextIndex[i] > len(rf.log) {
 				rf.nextIndex[i] = len(rf.log)
 			}
 			prevLogIndex := rf.nextIndex[i] - 1
+			//log.Println(rf.me, rf.log, prevLogIndex)
 			prevLogTerm := rf.log[prevLogIndex].Term
 			entries := rf.log[rf.nextIndex[i]: ]
 			args := AppendEntriesArgs{
@@ -379,14 +377,19 @@ func (rf *Raft) broadcastAppendEntries() {
 				LeaderCommit: 	rf.commitIndex,
 			}
 
-			//log.Println(rf.me, i, args, rf.log)
+			log.Println(rf.me, i, args, rf.log)
 
 			var reply AppendEntriesReply
+			if rf.state != LEADER {
+				return
+			}
 			ok := rf.sendAppendEntries(i, &args, &reply)
+			log.Println("rpc", ok)
 			if ok {
 				if reply.Success {
 					rf.mu.Lock()
 					rf.nextIndex[i] += len(entries)
+					log.Println(rf.me, rf.nextIndex[i], len(entries))
 					rf.matchIndex[i] = rf.nextIndex[i] - 1
 					rf.mu.Unlock()
 				} else {
@@ -415,7 +418,7 @@ func (rf *Raft) CommitLogs() {
 			if j == rf.me {
 				continue
 			}
-			//log.Println(j, rf.matchIndex[j], i, rf.log[i].Term, rf.currentTerm)
+			log.Println(j, rf.matchIndex[j], i, rf.log[i].Term, rf.currentTerm)
 			if rf.matchIndex[j] >= i && rf.log[i].Term == rf.currentTerm {
 				matchCount++
 			}
@@ -433,7 +436,7 @@ func (rf *Raft) CommitLogs() {
 		rf.chanCommit <- true
 		rf.mu.Unlock()
 	}
-	//log.Println(rf.me, "commitIdx", rf.commitIndex)
+	log.Println(rf.me, "commitIdx", rf.commitIndex)
 
 }
 
@@ -523,7 +526,7 @@ func (rf *Raft) CandidateJob() {
 			rf.becomeFollower()
 		case <- rf.chanVote:
 			rf.mu.Lock()
-			//log.Println("term", rf.currentTerm, rf.me, "become leader")
+			log.Println("term", rf.currentTerm, rf.me, "become leader")
 			rf.state = LEADER
 			rf.nextIndex = make([]int, rf.n)
 			rf.matchIndex = make([]int, rf.n)
